@@ -9,6 +9,7 @@ app = FastAPI()
 
 # --- Health / ping (som før) ---
 
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -20,6 +21,7 @@ def ping():
 
 
 # --- Simpel besked-model (V1) ---
+
 
 class MessageIn(BaseModel):
     name: str = Field(..., description="Navn eller label på afsender (fx 'Anon', 'Web visitor')")
@@ -54,5 +56,4 @@ def create_message(msg: MessageIn):
 @app.get("/messages", response_model=List[MessageOut])
 def list_messages():
     """Hent alle beskeder (senere kan vi filtrere pr. kunde/conversation)."""
-    # På sigt: paging, filtrering osv.
     return list(MESSAGES)
