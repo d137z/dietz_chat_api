@@ -5,8 +5,21 @@ import os
 
 from fastapi import FastAPI, Depends, Header, HTTPException
 from pydantic import BaseModel, Field
+from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://www.dietzcc.dk",
+        "https://dietzcc.dk",
+        "http://localhost:5173",  # til lokal test, valgfrit
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 # --- Health / ping ---
