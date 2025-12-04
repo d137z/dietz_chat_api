@@ -1,11 +1,122 @@
 from datetime import datetime
-from typing import List, Dict, Optional
-
+from typing import List, Dict, Optional, Set
 import os
+import json
+import logging
 
 from fastapi import FastAPI, Depends, Header, HTTPException
 from pydantic import BaseModel, Field
 from fastapi.middleware.cors import CORSMiddleware
+
+# --- Firebase / FCM setup (valgfri, men nødvendig for push) ---
+
+try:
+    import firebase_admin
+    from firebase_admin import credentials, messaging
+
+    FCM_AVAILABLE = True
+except ImportError:  # firebase_admin ikke installeret
+    firebase_admin = None  # type: ignore
+    credentials = None  # type: ignore
+    messaging = None  # type: ignore
+    FCM_AVAILABLE = False
+
+logger = logging.getLogger("dietz_chat_backend")
+logging.basicConfig(level=logging.INFO)
+
+
+def init_firebase_app():
+    """
+    Initialiser firebase_admin, hvis credentials er sat.
+
+    - Hvis env `FIREBASE_CREDENTIALS_JSON` er sat -> brug den (JSON-indhold).
+    - Ellers, hvis `GOOGLE_APPLICATION_CREDENTIALS` peger på en fil -> brug den.
+    - Ellers: ingen FCM (vi logger bare og kører videre uden push).
+    """
+    if not FCM_AVAILABLE:
+        logger.warning("firebase_admin ikke installeret; push-notifikationer er slået fra.")
+        return None
+
+    if firebase_admin._apps:
+        return firebase_admin.get_app()
+
+    cred = None
+    try:
+        cred_json = os.getenv("FIREBASE_CREDENTIALS_JSON")
+        if cred_json:
+            cred_dict = json.loads(cred_json)
+            cred = credentials.Certificate(cred_dict)
+        else:
+            cred_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+            if cred_path:
+                cred = credentials.Certificate(cred_path)
+
+        if cred is None:
+            logger.warning(
+                "Ingen Firebase credentials fundet (FIREBASE_CREDENTIALS_JSON eller "
+                "GOOGLE_APPLICATION_CREDENTIALS). Push-notifikationer er slået fra."
+            )
+            return None
+
+        app = firebase_admin.initialize_app(cred)
+        logger.info("Firebase app initialiseret til FCM.")
+        return app
+    except Exception as e:
+        logger.exception("Kunne ikke initialisere Firebase app: %s", e)
+        return None
+
+
+FIREBASE_APP = init_firebase_app()
+
+# --- Admin device tokens (in-memory) ---
+
+ADMIN_DEVICE_TOKENS: Set[str] = set()
+
+
+def send_push_to_admins(
+    title: str,
+    body: str,
+    data: Optional[Dict[str, str]] = None,
+) -> None:
+    """
+    Send en push til alle registrerede admin-devices.
+
+    Hvis FCM ikke er konfigureret, logger vi bare hvad vi ville sende.
+    """
+    if not FCM_AVAILABLE or FIREBASE_APP is None:
+        logger.info(
+            "FCM ikke konfigureret; ville have sendt push: %r / %r med data=%r",
+            title,
+            body,
+            data,
+        )
+        return
+
+    if not ADMIN_DEVICE_TOKENS:
+        logger.info("Ingen admin device tokens registreret; springer push over.")
+        return
+
+    try:
+        message = messaging.MulticastMessage(
+            notification=messaging.Notification(
+                title=title,
+                body=body,
+            ),
+            data=data or {},
+            tokens=list(ADMIN_DEVICE_TOKENS),
+        )
+        response = messaging.send_multicast(message)
+        logger.info(
+            "Sendte FCM multicase til %d tokens (success=%d, failure=%d)",
+            len(ADMIN_DEVICE_TOKENS),
+            response.success_count,
+            response.failure_count,
+        )
+    except Exception as e:
+        logger.exception("Fejl ved send af FCM-notifikationer: %s", e)
+
+
+# --- FastAPI app / CORS ---
 
 app = FastAPI()
 
@@ -76,6 +187,10 @@ class ConversationSummary(BaseModel):
     status: str  # "open" / "closed"
 
 
+class RegisterAdminDevice(BaseModel):
+    token: str = Field(..., description="FCM registration token for admin-appen")
+
+
 # --- In-memory "database" (nulstilles ved restart) ---
 
 
@@ -125,7 +240,11 @@ def create_conversation(initial_text: str) -> ConversationSummary:
     return conv
 
 
-def touch_conversation(conv_id: int, new_text: str, from_visitor: bool) -> ConversationSummary:
+def touch_conversation(
+    conv_id: int,
+    new_text: str,
+    from_visitor: bool,
+) -> ConversationSummary:
     """
     Opdater metadata for en eksisterende samtale.
     from_visitor=True  -> markér som ulæst (ny besked fra kunden)
@@ -196,6 +315,20 @@ def create_message(msg: MessageIn):
     )
     MESSAGES.append(new_msg)
     NEXT_MESSAGE_ID += 1
+
+    # 3) Send push til registrerede admin-devices (hvis FCM er sat op)
+    try:
+        preview = msg.text[:80]
+        send_push_to_admins(
+            title="Ny chatbesked",
+            body=preview,
+            data={
+                "conversation_id": str(conv_id),
+                "message_id": str(new_msg.id),
+            },
+        )
+    except Exception:
+        logger.exception("Kunne ikke sende FCM-push for ny besked")
 
     return new_msg
 
@@ -314,3 +447,26 @@ def update_conversation_status(
 
     conv.status = status
     return conv
+
+
+# --- Ny route: registrér admin-device til push ---
+
+
+@app.post("/admin/register-device")
+def register_admin_device(
+    payload: RegisterAdminDevice,
+    _: None = Depends(require_admin),
+):
+    """
+    Modtag og gem FCM-token for admin-appen.
+    Kaldt fra Android-appen, så backend ved hvem der skal have push.
+    """
+    token = payload.token.strip()
+    if not token:
+        raise HTTPException(status_code=400, detail="Empty token")
+
+    ADMIN_DEVICE_TOKENS.add(token)
+    logger.info(
+        "Registrerede admin-device token (nu %d tokens)", len(ADMIN_DEVICE_TOKENS)
+    )
+    return {"ok": True}
