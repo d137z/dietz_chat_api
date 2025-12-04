@@ -81,6 +81,7 @@ def send_push_to_admins(
     Send en push til alle registrerede admin-devices.
 
     Hvis FCM ikke er konfigureret, logger vi bare hvad vi ville sende.
+    Vi sender én besked pr. token (kompatibelt med ældre firebase-admin).
     """
     if not FCM_AVAILABLE or FIREBASE_APP is None:
         logger.info(
@@ -91,28 +92,37 @@ def send_push_to_admins(
         )
         return
 
-    if not ADMIN_DEVICE_TOKENS:
+    tokens = list(ADMIN_DEVICE_TOKENS)
+    if not tokens:
         logger.info("Ingen admin device tokens registreret; springer push over.")
         return
 
-    try:
-        message = messaging.MulticastMessage(
-            notification=messaging.Notification(
-                title=title,
-                body=body,
-            ),
-            data=data or {},
-            tokens=list(ADMIN_DEVICE_TOKENS),
-        )
-        response = messaging.send_multicast(message)
-        logger.info(
-            "Sendte FCM multicast til %d tokens (success=%d, failure=%d)",
-            len(ADMIN_DEVICE_TOKENS),
-            response.success_count,
-            response.failure_count,
-        )
-    except Exception as e:
-        logger.exception("Fejl ved send af FCM-notifikationer: %s", e)
+    successes = 0
+    failures = 0
+
+    for t in tokens:
+        try:
+            message = messaging.Message(
+                notification=messaging.Notification(
+                    title=title,
+                    body=body,
+                ),
+                data=data or {},
+                token=t,
+            )
+            messaging.send(message)
+            successes += 1
+        except Exception as e:
+            failures += 1
+            logger.exception("Fejl ved send af FCM-notifikation til token %s: %s", t, e)
+
+    logger.info(
+        "Sendte FCM notifikationer til %d tokens (success=%d, failure=%d)",
+        len(tokens),
+        successes,
+        failures,
+    )
+
 
 
 # --- FastAPI app / CORS ---
