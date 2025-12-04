@@ -8,14 +8,14 @@ from fastapi import FastAPI, Depends, Header, HTTPException
 from pydantic import BaseModel, Field
 from fastapi.middleware.cors import CORSMiddleware
 
-# --- Firebase / FCM setup (valgfri, men nødvendig for push) ---
+# --- Firebase / FCM setup ---
 
 try:
     import firebase_admin
     from firebase_admin import credentials, messaging
 
     FCM_AVAILABLE = True
-except ImportError:  # firebase_admin ikke installeret
+except ImportError:
     firebase_admin = None  # type: ignore
     credentials = None  # type: ignore
     messaging = None  # type: ignore
@@ -68,8 +68,7 @@ def init_firebase_app():
 
 FIREBASE_APP = init_firebase_app()
 
-# --- Admin device tokens (in-memory) ---
-
+# Gemmer FCM tokens for admin-appen (midlertidigt i RAM)
 ADMIN_DEVICE_TOKENS: Set[str] = set()
 
 
@@ -107,7 +106,7 @@ def send_push_to_admins(
         )
         response = messaging.send_multicast(message)
         logger.info(
-            "Sendte FCM multicase til %d tokens (success=%d, failure=%d)",
+            "Sendte FCM multicast til %d tokens (success=%d, failure=%d)",
             len(ADMIN_DEVICE_TOKENS),
             response.success_count,
             response.failure_count,
@@ -125,7 +124,7 @@ app.add_middleware(
     allow_origins=[
         "https://www.dietzcc.dk",
         "https://dietzcc.dk",
-        "http://localhost:5173",  # til lokal test, valgfrit
+        "http://localhost:5173",  # til lokal test
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -146,7 +145,7 @@ def ping():
     return {"message": "pong"}
 
 
-# --- Modeller til samtaler og beskeder ---
+# --- Modeller ---
 
 
 class MessageIn(BaseModel):
@@ -191,7 +190,7 @@ class RegisterAdminDevice(BaseModel):
     token: str = Field(..., description="FCM registration token for admin-appen")
 
 
-# --- In-memory "database" (nulstilles ved restart) ---
+# --- In-memory "database" ---
 
 
 MESSAGES: List[MessageOut] = []
@@ -268,7 +267,7 @@ def touch_conversation(
         conv.last_message_at = now
         conv.last_message_preview = new_text[:120]
         # Ny besked fra besøgende -> ulæst
-        # Svar fra dig -> læst
+        # Svar fra dig         -> læst
         conv.is_read = not from_visitor
 
     return conv
@@ -408,7 +407,6 @@ def get_conversation_messages(
 ):
     """
     Hent alle beskeder for én specifik samtale.
-    Perfekt til din Android-app senere.
     """
     return [m for m in MESSAGES if m.conversation_id == conversation_id]
 
@@ -449,7 +447,7 @@ def update_conversation_status(
     return conv
 
 
-# --- Ny route: registrér admin-device til push ---
+# --- Ny route: registrer admin-device til push ---
 
 
 @app.post("/admin/register-device")
