@@ -7,6 +7,7 @@ import logging
 from fastapi import FastAPI, Depends, Header, HTTPException
 from pydantic import BaseModel, Field
 from fastapi.middleware.cors import CORSMiddleware
+from firebase_client import get_db
 
 # --- Firebase / FCM setup ---
 
@@ -94,7 +95,7 @@ def send_push_to_admins(
 
     tokens = list(ADMIN_DEVICE_TOKENS)
     if not tokens:
-        logger.info("Ingen admin device tokens registreret; springer push over.")
+        logger.info("Ingen ADMIN_DEVICE_TOKENS registreret; ingen push sendt.")
         return
 
     successes = 0
@@ -117,12 +118,11 @@ def send_push_to_admins(
             logger.exception("Fejl ved send af FCM-notifikation til token %s: %s", t, e)
 
     logger.info(
-        "Sendte FCM notifikationer til %d tokens (success=%d, failure=%d)",
-        len(tokens),
+        "send_push_to_admins: %d succes, %d fejl (ud af %d tokens)",
         successes,
         failures,
+        len(tokens),
     )
-
 
 
 # --- FastAPI app / CORS ---
@@ -230,6 +230,8 @@ def require_admin(x_admin_token: Optional[str] = Header(default=None)):
 
 # --- Hjælpefunktioner ---
 
+# --- Hjælpefunktioner ---
+
 
 def create_conversation(initial_text: str) -> ConversationSummary:
     """Opret en helt ny samtale med første besked-tekst som preview."""
@@ -246,6 +248,10 @@ def create_conversation(initial_text: str) -> ConversationSummary:
     )
     CONVERSATIONS[conv.id] = conv
     NEXT_CONVERSATION_ID += 1
+
+    # Gem også i Firestore (best effort)
+    save_conversation_to_firestore(conv)
+
     return conv
 
 
@@ -280,7 +286,55 @@ def touch_conversation(
         # Svar fra dig         -> læst
         conv.is_read = not from_visitor
 
+    # Gem opdateret samtale i Firestore (best effort)
+    save_conversation_to_firestore(conv)
+
     return conv
+
+
+def save_conversation_to_firestore(conv: ConversationSummary) -> None:
+    """Gem samtalens metadata i Firestore (best effort)."""
+    try:
+        db = get_db()
+    except Exception:
+        logger.exception("Kunne ikke få Firestore-klient til at gemme conversation")
+        return
+
+    doc_ref = db.collection("conversations").document(str(conv.id))
+    doc_ref.set(
+        {
+            "id": conv.id,
+            "created_at": conv.created_at,
+            "last_message_at": conv.last_message_at,
+            "last_message_preview": conv.last_message_preview,
+            "is_read": conv.is_read,
+            "status": conv.status,
+        }
+    )
+
+
+def save_message_to_firestore(msg: MessageOut) -> None:
+    """Gem en enkelt besked i Firestore under samtalens messages-subcollection."""
+    try:
+        db = get_db()
+    except Exception:
+        logger.exception("Kunne ikke få Firestore-klient til at gemme message")
+        return
+
+    conv_ref = db.collection("conversations").document(str(msg.conversation_id))
+    msg_ref = conv_ref.collection("messages").document(str(msg.id))
+
+    msg_ref.set(
+        {
+            "id": msg.id,
+            "conversation_id": msg.conversation_id,
+            "text": msg.text,
+            "created_at": msg.created_at,
+            "sender": msg.sender,
+            "name": msg.name,
+            "email": msg.email,
+        }
+    )
 
 
 # --- Endpoints ---
@@ -325,6 +379,9 @@ def create_message(msg: MessageIn):
     MESSAGES.append(new_msg)
     NEXT_MESSAGE_ID += 1
 
+    # Gem beskeden i Firestore (best effort)
+    save_message_to_firestore(new_msg)
+
     # 3) Send push til registrerede admin-devices (hvis FCM er sat op)
     try:
         preview = msg.text[:80]
@@ -338,40 +395,6 @@ def create_message(msg: MessageIn):
         )
     except Exception:
         logger.exception("Kunne ikke sende FCM-push for ny besked")
-
-    return new_msg
-
-
-@app.post(
-    "/conversations/{conversation_id}/reply",
-    response_model=MessageOut,
-    response_model_exclude_none=True,
-)
-def reply_to_conversation(
-    conversation_id: int,
-    msg: MessageIn,
-    _: None = Depends(require_admin),
-):
-    """
-    Svar fra dig (agent) i en given samtale.
-    Bruger samme MessageIn-model, men ignorerer evt. conversation_id i payload.
-    """
-    global NEXT_MESSAGE_ID
-
-    # Sørg for at samtalen findes / opdateres
-    conv = touch_conversation(conversation_id, msg.text, from_visitor=False)
-
-    new_msg = MessageOut(
-        id=NEXT_MESSAGE_ID,
-        conversation_id=conv.id,
-        created_at=datetime.utcnow(),
-        text=msg.text,
-        sender="agent",
-        name=msg.name,
-        email=msg.email,
-    )
-    MESSAGES.append(new_msg)
-    NEXT_MESSAGE_ID += 1
 
     return new_msg
 
@@ -419,6 +442,43 @@ def get_conversation_messages(
     Hent alle beskeder for én specifik samtale.
     """
     return [m for m in MESSAGES if m.conversation_id == conversation_id]
+
+
+@app.post(
+    "/conversations/{conversation_id}/reply",
+    response_model=MessageOut,
+    response_model_exclude_none=True,
+)
+def reply_to_conversation(
+    conversation_id: int,
+    msg: MessageIn,
+    _: None = Depends(require_admin),
+):
+    """
+    Svar fra dig (agent) i en given samtale.
+    Bruger samme MessageIn-model, men ignorerer evt. conversation_id i payload.
+    """
+    global NEXT_MESSAGE_ID
+
+    # Sørg for at samtalen findes / opdateres
+    conv = touch_conversation(conversation_id, msg.text, from_visitor=False)
+
+    new_msg = MessageOut(
+        id=NEXT_MESSAGE_ID,
+        conversation_id=conv.id,
+        created_at=datetime.utcnow(),
+        text=msg.text,
+        sender="agent",
+        name=msg.name,
+        email=msg.email,
+    )
+    MESSAGES.append(new_msg)
+    NEXT_MESSAGE_ID += 1
+
+    # Gem beskeden i Firestore (best effort)
+    save_message_to_firestore(new_msg)
+
+    return new_msg
 
 
 @app.patch("/conversations/{conversation_id}/read", response_model=ConversationSummary)
