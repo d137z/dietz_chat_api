@@ -15,14 +15,13 @@ try:
 except ImportError:  # afhænger af firebase-admin extras
     gc_firestore = None  # type: ignore
 
-# --- Firebase / FCM setup ---
-
+# Firebase / FCM:
 try:
     import firebase_admin
     from firebase_admin import credentials, messaging
 
     FCM_AVAILABLE = True
-except ImportError:
+except ImportError:  # hvis firebase_admin ikke er installeret
     firebase_admin = None  # type: ignore
     credentials = None  # type: ignore
     messaging = None  # type: ignore
@@ -38,26 +37,44 @@ def init_firebase_app():
 
     - Hvis env `FIREBASE_CREDENTIALS_JSON` er sat -> brug den (JSON-indhold).
     - Ellers, hvis `GOOGLE_APPLICATION_CREDENTIALS` peger på en fil -> brug den.
-    - Ellers: ingen FCM (vi logger bare og kører videre uden push).
+    - Ellers: ingen FCM
     """
     if not FCM_AVAILABLE:
-        logger.warning("firebase_admin ikke installeret; push-notifikationer er slået fra.")
+        logger.info("firebase_admin ikke tilgængelig; FCM er slået fra.")
         return None
 
     if firebase_admin._apps:
+        # Allerede initialiseret
         return firebase_admin.get_app()
 
     cred = None
-    try:
-        cred_json = os.getenv("FIREBASE_CREDENTIALS_JSON")
-        if cred_json:
-            cred_dict = json.loads(cred_json)
-            cred = credentials.Certificate(cred_dict)
-        else:
-            cred_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-            if cred_path:
-                cred = credentials.Certificate(cred_path)
 
+    # 1) Prøv via env-variabel med JSON
+    raw_json = os.getenv("FIREBASE_CREDENTIALS_JSON")
+    if raw_json:
+        try:
+            data = json.loads(raw_json)
+            cred = credentials.Certificate(data)
+            logger.info("Firebase credentials indlæst fra FIREBASE_CREDENTIALS_JSON.")
+        except Exception as e:
+            logger.exception("Kunne ikke parse FIREBASE_CREDENTIALS_JSON: %s", e)
+
+    # 2) Prøv via GOOGLE_APPLICATION_CREDENTIALS (sti til fil)
+    if cred is None:
+        path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+        if path and os.path.exists(path):
+            try:
+                cred = credentials.Certificate(path)
+                logger.info(
+                    "Firebase credentials indlæst fra GOOGLE_APPLICATION_CREDENTIALS=%s",
+                    path,
+                )
+            except Exception as e:
+                logger.exception(
+                    "Kunne ikke indlæse credentials fra fil %s: %s", path, e
+                )
+
+    try:
         if cred is None:
             logger.warning(
                 "Ingen Firebase credentials fundet (FIREBASE_CREDENTIALS_JSON eller "
@@ -77,9 +94,11 @@ FIREBASE_APP = init_firebase_app()
 
 # Gemmer FCM tokens for admin-appen (midlertidigt i RAM)
 ADMIN_DEVICE_TOKENS: Set[str] = set()
+
 # Admin tokens gemmes i Firestore i collection "admin_devices"
 ADMIN_TOKENS_INITIALIZED = False
 ADMIN_TOKENS_COLLECTION = "admin_devices"
+
 
 def save_admin_device_token(token: str) -> None:
     """
@@ -167,6 +186,9 @@ def send_push_to_admins(
         )
         return
 
+    # Sørg for at tokens er indlæst fra Firestore (kun én gang per proces)
+    ensure_admin_tokens_loaded()
+
     tokens = list(ADMIN_DEVICE_TOKENS)
     if not tokens:
         logger.info("Ingen ADMIN_DEVICE_TOKENS registreret; ingen push sendt.")
@@ -177,19 +199,17 @@ def send_push_to_admins(
 
     for t in tokens:
         try:
-            message = messaging.Message(
-                notification=messaging.Notification(
-                    title=title,
-                    body=body,
-                ),
-                data=data or {},
+            msg = messaging.Message(
                 token=t,
+                notification=messaging.Notification(title=title, body=body),
+                data=data or {},
             )
-            messaging.send(message)
+            response = messaging.send(msg)
+            logger.info("Sendte push til %s, response=%s", t, response)
             successes += 1
-        except Exception as e:
+        except Exception:
+            logger.exception("Fejl ved send push til token=%s", t)
             failures += 1
-            logger.exception("Fejl ved send af FCM-notifikation til token %s: %s", t, e)
 
     logger.info(
         "send_push_to_admins: %d succes, %d fejl (ud af %d tokens)",
@@ -206,9 +226,7 @@ app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "https://www.dietzcc.dk",
-        "https://dietzcc.dk",
-        "http://localhost:5173",  # til lokal test
+        "*",  # Juster evt. til din hjemmeside, f.eks. "https://dietzcc.dk"
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -216,20 +234,7 @@ app.add_middleware(
 )
 
 
-# --- Health / ping ---
-
-
-@app.get("/health")
-def health():
-    return {"status": "ok"}
-
-
-@app.get("/ping")
-def ping():
-    return {"message": "pong"}
-
-
-# --- Modeller ---
+# --- Models ---
 
 
 class MessageIn(BaseModel):
@@ -274,7 +279,7 @@ class RegisterAdminDevice(BaseModel):
     token: str = Field(..., description="FCM registration token for admin-appen")
 
 
-# --- In-memory "database" (cache) ---
+# --- In-memory "database" (backup hvis Firestore er nede) ---
 
 
 MESSAGES: List[MessageOut] = []
@@ -284,32 +289,10 @@ NEXT_CONVERSATION_ID = 1
 COUNTERS_INITIALIZED = False
 
 
-# --- Simpel admin-auth ---
-
-
-ADMIN_TOKEN = os.getenv("ADMIN_TOKEN")
-
-
-def require_admin(x_admin_token: Optional[str] = Header(default=None)):
-    """
-    Simpel admin-beskyttelse:
-    - Sæt ADMIN_TOKEN som environment variable på Render.
-    - Send headeren: X-Admin-Token: <samme værdi> fra din app.
-    Hvis ADMIN_TOKEN ikke er sat, tillader vi alle (dev-mode).
-    """
-    if ADMIN_TOKEN is None:
-        return
-    if x_admin_token != ADMIN_TOKEN:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-
-# --- Hjælpefunktioner ---
-
-
 def init_counters_from_firestore() -> None:
     """
-    Sync NEXT_CONVERSATION_ID og NEXT_MESSAGE_ID med det, der allerede ligger i Firestore.
-    Kører kun én gang pr. proces.
+    Læs max conversation id og max message id fra Firestore én gang,
+    så vi kan fortsætte tælling på tværs af reboots.
     """
     global COUNTERS_INITIALIZED, NEXT_CONVERSATION_ID, NEXT_MESSAGE_ID
 
@@ -331,35 +314,27 @@ def init_counters_from_firestore() -> None:
     max_conv_id = 0
     max_msg_id = 0
 
-    # Find højeste conversation-id
+    # Læs alle conversations
     try:
-        conv_query = (
-            db.collection("conversations")
-            .order_by("id", direction=gc_firestore.Query.DESCENDING)
-            .limit(1)
-        )
-        conv_docs = list(conv_query.stream())
-        if conv_docs:
-            data = conv_docs[0].to_dict() or {}
+        conv_docs = db.collection("conversations").stream()
+        for doc in conv_docs:
+            data = doc.to_dict() or {}
             if "id" in data:
-                max_conv_id = int(data["id"])
+                cid = int(data["id"])
+                max_conv_id = max(max_conv_id, cid)
     except Exception:
         logger.exception("Fejl ved læsning af max conversation id fra Firestore")
 
-    # Find højeste message-id via collection group
-    try:
-        msg_query = (
-            db.collection_group("messages")
-            .order_by("id", direction=gc_firestore.Query.DESCENDING)
-            .limit(1)
-        )
-        msg_docs = list(msg_query.stream())
-        if msg_docs:
-            data = msg_docs[0].to_dict() or {}
-            if "id" in data:
-                max_msg_id = int(data["id"])
-    except Exception:
-        logger.exception("Fejl ved læsning af max message id fra Firestore")
+    # Læs alle messages via collection group, hvis muligt
+    if gc_firestore is not None:
+        try:
+            msg_docs = db.collection_group("messages").stream()
+            for doc in msg_docs:
+                data = doc.to_dict() or {}
+                if "id" in data:
+                    max_msg_id = int(data["id"])
+        except Exception:
+            logger.exception("Fejl ved læsning af max message id fra Firestore")
 
     if max_conv_id >= NEXT_CONVERSATION_ID:
         NEXT_CONVERSATION_ID = max_conv_id + 1
@@ -374,6 +349,32 @@ def init_counters_from_firestore() -> None:
     )
 
 
+def save_conversation_to_firestore(conv: ConversationSummary) -> None:
+    """
+    Gem/overskriv en ConversationSummary i Firestore.
+    """
+    try:
+        db = get_db()
+    except Exception:
+        logger.exception("Kunne ikke få Firestore-klient til at gemme conversation")
+        return
+
+    doc_ref = db.collection("conversations").document(str(conv.id))
+    try:
+        doc_ref.set(
+            {
+                "id": conv.id,
+                "created_at": conv.created_at,
+                "last_message_at": conv.last_message_at,
+                "last_message_preview": conv.last_message_preview,
+                "is_read": conv.is_read,
+                "status": conv.status,
+            }
+        )
+    except Exception:
+        logger.exception("Fejl ved skriv af conversation til Firestore")
+
+
 def load_conversation_from_firestore(conv_id: int) -> Optional[ConversationSummary]:
     """
     Hent én conversation fra Firestore ud fra id.
@@ -384,44 +385,35 @@ def load_conversation_from_firestore(conv_id: int) -> Optional[ConversationSumma
         logger.exception("Kunne ikke få Firestore-klient til at hente conversation")
         return None
 
-    doc = db.collection("conversations").document(str(conv_id)).get()
+    doc_ref = db.collection("conversations").document(str(conv_id))
+    try:
+        doc = doc_ref.get()
+    except Exception:
+        logger.exception("Fejl ved læsning af conversation %s fra Firestore", conv_id)
+        return None
+
     if not doc.exists:
         return None
 
     data = doc.to_dict() or {}
-    return ConversationSummary(
-        id=int(data.get("id", conv_id)),
-        created_at=data.get("created_at", datetime.utcnow()),
-        last_message_at=data.get("last_message_at", datetime.utcnow()),
-        last_message_preview=data.get("last_message_preview", ""),
-        is_read=bool(data.get("is_read", False)),
-        status=data.get("status", "open"),
-    )
-
-
-def save_conversation_to_firestore(conv: ConversationSummary) -> None:
-    """Gem samtalens metadata i Firestore (best effort)."""
     try:
-        db = get_db()
+        return ConversationSummary(
+            id=int(data["id"]),
+            created_at=data["created_at"],
+            last_message_at=data["last_message_at"],
+            last_message_preview=data["last_message_preview"],
+            is_read=bool(data.get("is_read", False)),
+            status=data.get("status", "open"),
+        )
     except Exception:
-        logger.exception("Kunne ikke få Firestore-klient til at gemme conversation")
-        return
-
-    doc_ref = db.collection("conversations").document(str(conv.id))
-    doc_ref.set(
-        {
-            "id": conv.id,
-            "created_at": conv.created_at,
-            "last_message_at": conv.last_message_at,
-            "last_message_preview": conv.last_message_preview,
-            "is_read": conv.is_read,
-            "status": conv.status,
-        }
-    )
+        logger.exception("Kunne ikke parse conversation-doc %s", conv_id)
+        return None
 
 
 def save_message_to_firestore(msg: MessageOut) -> None:
-    """Gem en enkelt besked i Firestore under samtalens messages-subcollection."""
+    """
+    Gem én besked i Firestore under conversations/{id}/messages/{msg.id}
+    """
     try:
         db = get_db()
     except Exception:
@@ -430,84 +422,82 @@ def save_message_to_firestore(msg: MessageOut) -> None:
 
     conv_ref = db.collection("conversations").document(str(msg.conversation_id))
     msg_ref = conv_ref.collection("messages").document(str(msg.id))
+    try:
+        msg_ref.set(
+            {
+                "id": msg.id,
+                "conversation_id": msg.conversation_id,
+                "text": msg.text,
+                "created_at": msg.created_at,
+                "sender": msg.sender,
+                "name": msg.name,
+                "email": msg.email,
+            }
+        )
+    except Exception:
+        logger.exception(
+            "Fejl ved skriv af message %s (conversation %s) til Firestore",
+            msg.id,
+            msg.conversation_id,
+        )
 
-    msg_ref.set(
-        {
-            "id": msg.id,
-            "conversation_id": msg.conversation_id,
-            "text": msg.text,
-            "created_at": msg.created_at,
-            "sender": msg.sender,
-            "name": msg.name,
-            "email": msg.email,
-        }
-    )
 
-
-def create_conversation(initial_text: str) -> ConversationSummary:
-    """Opret en helt ny samtale med første besked-tekst som preview."""
+def create_conversation(first_message_text: str) -> ConversationSummary:
+    """
+    Opret en ny samtale (både i RAM og i Firestore).
+    """
     global NEXT_CONVERSATION_ID
 
     init_counters_from_firestore()
 
+    conv_id = NEXT_CONVERSATION_ID
+    NEXT_CONVERSATION_ID += 1
+
     now = datetime.utcnow()
     conv = ConversationSummary(
-        id=NEXT_CONVERSATION_ID,
+        id=conv_id,
         created_at=now,
         last_message_at=now,
-        last_message_preview=initial_text[:120],
+        last_message_preview=first_message_text[:120],
         is_read=False,
         status="open",
     )
-    CONVERSATIONS[conv.id] = conv
-    NEXT_CONVERSATION_ID += 1
+    CONVERSATIONS[conv_id] = conv
 
-    # Gem også i Firestore (best effort)
     save_conversation_to_firestore(conv)
-
     return conv
 
 
 def touch_conversation(
-    conv_id: int,
-    new_text: str,
-    from_visitor: bool,
+    conv_id: int, last_text: str, from_visitor: bool = False
 ) -> ConversationSummary:
     """
-    Opdater metadata for en eksisterende samtale.
-    from_visitor=True  -> markér som ulæst (ny besked fra kunden)
-    from_visitor=False -> markér som læst (du har svaret)
+    Opdater last_message_at / last_message_preview / is_read for en conversation.
+
+    Hvis conversation ikke fandtes i RAM, oprettes en "stub", som så kan overskrives
+    når load_conversation_from_firestore senere kaldes.
     """
     now = datetime.utcnow()
-    conv = CONVERSATIONS.get(conv_id)
 
-    if conv is None:
-        # Hvis der ikke ligger noget i RAM, prøv Firestore
-        existing = load_conversation_from_firestore(conv_id)
-        if existing is not None:
-            conv = existing
-        else:
-            # Opret en ny samtale hvis helt ukendt id
-            conv = ConversationSummary(
-                id=conv_id,
-                created_at=now,
-                last_message_at=now,
-                last_message_preview=new_text[:120],
-                is_read=not from_visitor,
-                status="open",
-            )
+    if conv_id in CONVERSATIONS:
+        conv = CONVERSATIONS[conv_id]
+    else:
+        conv = ConversationSummary(
+            id=conv_id,
+            created_at=now,
+            last_message_at=now,
+            last_message_preview=last_text[:120],
+            is_read=False,
+            status="open",
+        )
 
     conv.last_message_at = now
-    conv.last_message_preview = new_text[:120]
-    # Ny besked fra besøgende -> ulæst
-    # Svar fra dig           -> læst
-    conv.is_read = not from_visitor
+    conv.last_message_preview = last_text[:120]
+    if from_visitor:
+        conv.is_read = False
 
-    CONVERSATIONS[conv.id] = conv
-
-    # Gem opdateret samtale i Firestore (best effort)
+    CONVERSATIONS[conv_id] = conv
     save_conversation_to_firestore(conv)
-
     return conv
 
 
@@ -542,45 +532,51 @@ def create_message(msg: MessageIn):
             # Prøv at hente fra Firestore, hvis API er blevet genstartet
             existing = load_conversation_from_firestore(conv_id)
             if existing is not None:
-                CONVERSATIONS[existing.id] = existing
-                conv = touch_conversation(existing.id, msg.text, from_visitor=True)
-                conv_id = conv.id
+                CONVERSATIONS[conv_id] = existing
+                conv = touch_conversation(conv_id, msg.text, from_visitor=True)
             else:
-                # Hvis conversation-id virkelig ikke findes, start ny
-                conv = create_conversation(msg.text)
-                conv_id = conv.id
+                # Hvis den slet ikke findes, opret en ny samtale med det id
+                now = datetime.utcnow()
+                conv = ConversationSummary(
+                    id=conv_id,
+                    created_at=now,
+                    last_message_at=now,
+                    last_message_preview=msg.text[:120],
+                    is_read=False,
+                    status="open",
+                )
+                CONVERSATIONS[conv_id] = conv
+                save_conversation_to_firestore(conv)
 
     # 2) Opret selve beskeden
-    new_msg = MessageOut(
-        id=NEXT_MESSAGE_ID,
+    message_id = NEXT_MESSAGE_ID
+    NEXT_MESSAGE_ID += 1
+
+    now = datetime.utcnow()
+    out = MessageOut(
+        id=message_id,
         conversation_id=conv_id,
-        created_at=datetime.utcnow(),
         text=msg.text,
+        created_at=now,
         sender="visitor",
         name=msg.name,
         email=msg.email,
     )
-    MESSAGES.append(new_msg)
-    NEXT_MESSAGE_ID += 1
 
-    # Gem beskeden i Firestore (best effort)
-    save_message_to_firestore(new_msg)
+    MESSAGES.append(out)
+    save_message_to_firestore(out)
 
-    # 3) Send push til registrerede admin-devices (hvis FCM er sat op)
-    try:
-        preview = msg.text[:80]
-        send_push_to_admins(
-            title="Ny chatbesked",
-            body=preview,
-            data={
-                "conversation_id": str(conv_id),
-                "message_id": str(new_msg.id),
-            },
-        )
-    except Exception:
-        logger.exception("Kunne ikke sende FCM-push for ny besked")
+    # 3) Opdater conversation (last_message_*)
+    conv = touch_conversation(conv_id, msg.text, from_visitor=True)
 
-    return new_msg
+    # 4) Send push til admin (best effort)
+    send_push_to_admins(
+        title="Ny besked på dietzcc.dk",
+        body=msg.text[:120],
+        data={"conversation_id": str(conv_id)},
+    )
+
+    return out
 
 
 @app.get(
@@ -612,9 +608,7 @@ def list_messages(conversation_id: Optional[int] = None):
         # Bruger collection group til at hente alle beskeder
         if gc_firestore is None:
             # Fald tilbage til RAM
-            if conversation_id is None:
-                return list(MESSAGES)
-            return [m for m in MESSAGES if m.conversation_id == conversation_id]
+            return list(MESSAGES)
         query = db.collection_group("messages").order_by("created_at")
         docs = query.stream()
 
@@ -624,11 +618,11 @@ def list_messages(conversation_id: Optional[int] = None):
         try:
             results.append(
                 MessageOut(
-                    id=int(data.get("id")),
-                    conversation_id=int(data.get("conversation_id")),
-                    text=data.get("text", ""),
-                    created_at=data.get("created_at", datetime.utcnow()),
-                    sender=data.get("sender", "visitor"),
+                    id=int(data["id"]),
+                    conversation_id=int(data["conversation_id"]),
+                    text=data["text"],
+                    created_at=data["created_at"],
+                    sender=data["sender"],
                     name=data.get("name"),
                     email=data.get("email"),
                 )
@@ -648,27 +642,31 @@ def list_conversations(_: None = Depends(require_admin)):
         db = get_db()
     except Exception:
         logger.exception("Kunne ikke få Firestore-klient til at liste conversations")
-        # Fald tilbage til hvad vi har i RAM
-        convs = list(CONVERSATIONS.values())
-    else:
+        # Fald tilbage til in-memory
+        return list(CONVERSATIONS.values())
+
+    try:
         docs = db.collection("conversations").stream()
-        convs: List[ConversationSummary] = []
-        for doc in docs:
-            data = doc.to_dict() or {}
-            try:
-                conv = ConversationSummary(
-                    id=int(data.get("id")),
-                    created_at=data.get("created_at", datetime.utcnow()),
-                    last_message_at=data.get("last_message_at", datetime.utcnow()),
-                    last_message_preview=data.get("last_message_preview", ""),
+    except Exception:
+        logger.exception("Fejl ved hentning af conversations fra Firestore")
+        return list(CONVERSATIONS.values())
+
+    convs: List[ConversationSummary] = []
+    for doc in docs:
+        data = doc.to_dict() or {}
+        try:
+            convs.append(
+                ConversationSummary(
+                    id=int(data["id"]),
+                    created_at=data["created_at"],
+                    last_message_at=data["last_message_at"],
+                    last_message_preview=data["last_message_preview"],
                     is_read=bool(data.get("is_read", False)),
                     status=data.get("status", "open"),
                 )
-                convs.append(conv)
-                # Hold RAM-cache nogenlunde i sync
-                CONVERSATIONS[conv.id] = conv
-            except Exception:
-                logger.exception("Kunne ikke parse conversation-dokument %s", doc.id)
+            )
+        except Exception:
+            logger.exception("Kunne ikke parse conversation-dokument %s", doc.id)
 
     # Returnér først ulæste, dernæst efter seneste aktivitet
     return sorted(
@@ -687,17 +685,21 @@ def get_conversation_messages(
     _: None = Depends(require_admin),
 ):
     """
-    Hent alle beskeder for én specifik samtale – læst fra Firestore.
+    Hent alle beskeder for én conversation.
     """
     try:
         db = get_db()
     except Exception:
-        logger.exception("Kunne ikke få Firestore-klient til at hente conversation messages")
+        logger.exception("Kunne ikke få Firestore-klient til at hente messages")
+        # Fald tilbage til RAM
         return [m for m in MESSAGES if m.conversation_id == conversation_id]
 
     conv_ref = db.collection("conversations").document(str(conversation_id))
-    query = conv_ref.collection("messages").order_by("created_at")
-    docs = query.stream()
+    try:
+        docs = conv_ref.collection("messages").order_by("created_at").stream()
+    except Exception:
+        logger.exception("Fejl ved hentning af messages for conversation %s", conversation_id)
+        return [m for m in MESSAGES if m.conversation_id == conversation_id]
 
     results: List[MessageOut] = []
     for doc in docs:
@@ -705,108 +707,78 @@ def get_conversation_messages(
         try:
             results.append(
                 MessageOut(
-                    id=int(data.get("id")),
-                    conversation_id=int(data.get("conversation_id")),
-                    text=data.get("text", ""),
-                    created_at=data.get("created_at", datetime.utcnow()),
-                    sender=data.get("sender", "visitor"),
+                    id=int(data["id"]),
+                    conversation_id=int(data["conversation_id"]),
+                    text=data["text"],
+                    created_at=data["created_at"],
+                    sender=data["sender"],
                     name=data.get("name"),
                     email=data.get("email"),
                 )
             )
         except Exception:
-            logger.exception("Kunne ikke parse message-dokument %s", doc.id)
+            logger.exception("Kunne ikke parse message-doc %s", doc.id)
 
     return results
 
 
+# --- Admin auth placeholder (for f.eks. simpel header) ---
+
+
+def require_admin(x_admin_token: str = Header(..., alias="X-Admin-Token")):
+    """
+    Simpel beskyttelse: kræver at der sendes en header X-Admin-Token
+    som matcher en hemmelig værdi i env ADMIN_API_TOKEN.
+    """
+    expected = os.getenv("ADMIN_API_TOKEN")
+    if not expected:
+        # Hvis der ikke er sat nogen token, tillader vi alt (dev-mode).
+        return None
+
+    if x_admin_token != expected:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    return None
+
+
+# --- Ekstra endpoint til at markere conversation som læst/ulæst og ændre status ---
+
+
+class UpdateConversationStatus(BaseModel):
+    is_read: Optional[bool] = None
+    status: Optional[str] = None  # "open" / "closed"
+
+
 @app.post(
-    "/conversations/{conversation_id}/reply",
-    response_model=MessageOut,
+    "/conversations/{conversation_id}/status",
+    response_model=ConversationSummary,
     response_model_exclude_none=True,
 )
-def reply_to_conversation(
-    conversation_id: int,
-    msg: MessageIn,
-    _: None = Depends(require_admin),
-):
-    """
-    Svar fra dig (agent) i en given samtale.
-    Bruger samme MessageIn-model, men ignorerer evt. conversation_id i payload.
-    """
-    global NEXT_MESSAGE_ID
-
-    init_counters_from_firestore()
-
-    # Sørg for at samtalen findes
-    conv = CONVERSATIONS.get(conversation_id)
-    if conv is None:
-        existing = load_conversation_from_firestore(conversation_id)
-        if existing is None:
-            raise HTTPException(status_code=404, detail="Conversation not found")
-        CONVERSATIONS[existing.id] = existing
-        conv = existing
-
-    conv = touch_conversation(conversation_id, msg.text, from_visitor=False)
-
-    new_msg = MessageOut(
-        id=NEXT_MESSAGE_ID,
-        conversation_id=conv.id,
-        created_at=datetime.utcnow(),
-        text=msg.text,
-        sender="agent",
-        name=msg.name,
-        email=msg.email,
-    )
-    MESSAGES.append(new_msg)
-    NEXT_MESSAGE_ID += 1
-
-    # Gem beskeden i Firestore (best effort)
-    save_message_to_firestore(new_msg)
-
-    return new_msg
-
-
-@app.patch("/conversations/{conversation_id}/read", response_model=ConversationSummary)
-def mark_conversation_read(
-    conversation_id: int,
-    _: None = Depends(require_admin),
-):
-    """
-    Markér en samtale som læst (fx når du har åbnet den i appen).
-    """
-    conv = CONVERSATIONS.get(conversation_id)
-    if conv is None:
-        conv = load_conversation_from_firestore(conversation_id)
-        if conv is None:
-            raise HTTPException(status_code=404, detail="Conversation not found")
-
-    conv.is_read = True
-    CONVERSATIONS[conv.id] = conv
-    save_conversation_to_firestore(conv)
-
-    return conv
-
-
-@app.patch("/conversations/{conversation_id}/status", response_model=ConversationSummary)
 def update_conversation_status(
     conversation_id: int,
-    status: str,
+    payload: UpdateConversationStatus,
     _: None = Depends(require_admin),
 ):
     """
-    Opdatér status på en samtale, fx 'open' eller 'closed'.
+    Opdater status/is_read på en conversation.
     """
-    if status not in {"open", "closed"}:
-        raise HTTPException(status_code=400, detail="Invalid status")
-
-    conv = CONVERSATIONS.get(conversation_id)
-    if conv is None:
+    # Forsøg først i RAM
+    if conversation_id in CONVERSATIONS:
+        conv = CONVERSATIONS[conversation_id]
+    else:
         conv = load_conversation_from_firestore(conversation_id)
         if conv is None:
             raise HTTPException(status_code=404, detail="Conversation not found")
+        CONVERSATIONS[conversation_id] = conv
 
-    conv.status = status
+    if payload.is_read is not None:
+        conv.is_read = payload.is_read
+
+    if payload.status is not None:
+        if payload.status not in ("open", "closed"):
+            raise HTTPException(status_code=400, detail="Invalid status")
+        conv.status = payload.status
+
     CONVERSATIONS[conv.id] = conv
     save_conversation_to_firestore(conv)
 
@@ -829,7 +801,11 @@ def register_admin_device(
     if not token:
         raise HTTPException(status_code=400, detail="Empty token")
 
+    # Opdater in-memory sæt
     ADMIN_DEVICE_TOKENS.add(token)
+
+    # Gem også i Firestore
+    save_admin_device_token(token)
     logger.info(
         "Registrerede admin-device token (nu %d tokens)", len(ADMIN_DEVICE_TOKENS)
     )
