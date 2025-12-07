@@ -78,6 +78,76 @@ FIREBASE_APP = init_firebase_app()
 # Gemmer FCM tokens for admin-appen (midlertidigt i RAM)
 ADMIN_DEVICE_TOKENS: Set[str] = set()
 
+# Admin tokens gemmes i Firestore i collection "admin_devices"
+ADMIN_TOKENS_INITIALIZED = False
+ADMIN_TOKENS_COLLECTION = "admin_devices"
+
+
+def save_admin_device_token(token: str) -> None:
+    """
+    Gem / opdater et admin-device token i Firestore.
+    """
+    try:
+        db = get_db()
+    except Exception:
+        logger.exception("Kunne ikke gemme admin-device token i Firestore")
+        return
+
+    # Brug token som dokument-id, så du undgår dubletter
+    doc_ref = db.collection(ADMIN_TOKENS_COLLECTION).document(token)
+    try:
+        doc_ref.set(
+            {
+                "token": token,
+                "updated_at": datetime.utcnow(),
+            },
+            merge=True,  # så vi kan opdatere uden at slette andre felter senere
+        )
+    except Exception:
+        logger.exception("Fejl ved skriv til admin_devices i Firestore")
+
+
+def load_admin_device_tokens() -> None:
+    """
+    Læs alle admin-device tokens fra Firestore ind i ADMIN_DEVICE_TOKENS.
+    """
+    global ADMIN_DEVICE_TOKENS
+
+    try:
+        db = get_db()
+    except Exception:
+        logger.exception("Kan ikke læse admin_devices i Firestore")
+        return
+
+    tokens: Set[str] = set()
+
+    try:
+        docs = db.collection(ADMIN_TOKENS_COLLECTION).stream()
+    except Exception:
+        logger.exception("Fejl ved stream af admin_devices collection")
+        return
+
+    for doc in docs:
+        data = doc.to_dict() or {}
+        token = data.get("token") or doc.id
+        if token:
+            tokens.add(token)
+
+    ADMIN_DEVICE_TOKENS = tokens
+    logger.info("Indlæste %d admin tokens fra Firestore", len(ADMIN_DEVICE_TOKENS))
+
+
+def ensure_admin_tokens_loaded() -> None:
+    """
+    Sørger for, at ADMIN_DEVICE_TOKENS er indlæst fra Firestore én gang.
+    """
+    global ADMIN_TOKENS_INITIALIZED
+    if ADMIN_TOKENS_INITIALIZED:
+        return
+
+    ADMIN_TOKENS_INITIALIZED = True
+    load_admin_device_tokens()
+
 
 def send_push_to_admins(
     title: str,
@@ -98,6 +168,9 @@ def send_push_to_admins(
             data,
         )
         return
+
+    # Sørg for at tokens er indlæst fra Firestore (kun én gang per proces)
+    ensure_admin_tokens_loaded()
 
     tokens = list(ADMIN_DEVICE_TOKENS)
     if not tokens:
@@ -761,7 +834,12 @@ def register_admin_device(
     if not token:
         raise HTTPException(status_code=400, detail="Empty token")
 
+    # Opdater in-memory sæt
     ADMIN_DEVICE_TOKENS.add(token)
+
+    # Gem også i Firestore
+    save_admin_device_token(token)
+
     logger.info(
         "Registrerede admin-device token (nu %d tokens)", len(ADMIN_DEVICE_TOKENS)
     )
