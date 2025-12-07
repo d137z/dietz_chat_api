@@ -15,13 +15,14 @@ try:
 except ImportError:  # afhænger af firebase-admin extras
     gc_firestore = None  # type: ignore
 
-# Firebase / FCM:
+# --- Firebase / FCM setup ---
+
 try:
     import firebase_admin
     from firebase_admin import credentials, messaging
 
     FCM_AVAILABLE = True
-except ImportError:  # hvis firebase_admin ikke er installeret
+except ImportError:
     firebase_admin = None  # type: ignore
     credentials = None  # type: ignore
     messaging = None  # type: ignore
@@ -199,20 +200,22 @@ def send_push_to_admins(
 
     for t in tokens:
         try:
-            msg = messaging.Message(
-                token=t,
-                notification=messaging.Notification(title=title, body=body),
+            message = messaging.Message(
+                notification=messaging.Notification(
+                    title=title,
+                    body=body,
+                ),
                 data=data or {},
+                token=t,
             )
-            response = messaging.send(msg)
-            logger.info("Sendte push til %s, response=%s", t, response)
+            messaging.send(message)
             successes += 1
         except Exception:
             logger.exception("Fejl ved send push til token=%s", t)
             failures += 1
 
     logger.info(
-        "send_push_to_admins: %d succes, %d fejl (ud af %d tokens)",
+        "send_push_to_admins færdig. Succes: %d, Fejl: %d, Tokens i alt: %d",
         successes,
         failures,
         len(tokens),
@@ -225,9 +228,7 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "*",  # Juster evt. til din hjemmeside, f.eks. "https://dietzcc.dk"
-    ],
+    allow_origins=["*"],  # Juster til din domain hvis du vil
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -288,6 +289,21 @@ NEXT_MESSAGE_ID = 1
 NEXT_CONVERSATION_ID = 1
 COUNTERS_INITIALIZED = False
 
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN")
+
+
+def require_admin(x_admin_token: Optional[str] = Header(default=None)):
+    """
+    Simpel admin-beskyttelse:
+    - Sæt ADMIN_TOKEN som environment variable på Render.
+    - Send headeren: X-Admin-Token: <samme værdi> fra din app.
+    Hvis ADMIN_TOKEN ikke er sat, tillader vi alle (dev-mode).
+    """
+    if ADMIN_TOKEN is None:
+        return
+    if x_admin_token != ADMIN_TOKEN:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
 
 def init_counters_from_firestore() -> None:
     """
@@ -314,27 +330,35 @@ def init_counters_from_firestore() -> None:
     max_conv_id = 0
     max_msg_id = 0
 
-    # Læs alle conversations
+    # Find højeste conversation-id
     try:
-        conv_docs = db.collection("conversations").stream()
-        for doc in conv_docs:
-            data = doc.to_dict() or {}
+        conv_query = (
+            db.collection("conversations")
+            .order_by("id", direction=gc_firestore.Query.DESCENDING)
+            .limit(1)
+        )
+        conv_docs = list(conv_query.stream())
+        if conv_docs:
+            data = conv_docs[0].to_dict() or {}
             if "id" in data:
-                cid = int(data["id"])
-                max_conv_id = max(max_conv_id, cid)
+                max_conv_id = int(data["id"])
     except Exception:
         logger.exception("Fejl ved læsning af max conversation id fra Firestore")
 
-    # Læs alle messages via collection group, hvis muligt
-    if gc_firestore is not None:
-        try:
-            msg_docs = db.collection_group("messages").stream()
-            for doc in msg_docs:
-                data = doc.to_dict() or {}
-                if "id" in data:
-                    max_msg_id = int(data["id"])
-        except Exception:
-            logger.exception("Fejl ved læsning af max message id fra Firestore")
+    # Find højeste message-id via collection group
+    try:
+        msg_query = (
+            db.collection_group("messages")
+            .order_by("id", direction=gc_firestore.Query.DESCENDING)
+            .limit(1)
+        )
+        msg_docs = list(msg_query.stream())
+        if msg_docs:
+            data = msg_docs[0].to_dict() or {}
+            if "id" in data:
+                max_msg_id = int(data["id"])
+    except Exception:
+        logger.exception("Fejl ved læsning af max message id fra Firestore")
 
     if max_conv_id >= NEXT_CONVERSATION_ID:
         NEXT_CONVERSATION_ID = max_conv_id + 1
@@ -570,11 +594,20 @@ def create_message(msg: MessageIn):
     conv = touch_conversation(conv_id, msg.text, from_visitor=True)
 
     # 4) Send push til admin (best effort)
-    send_push_to_admins(
-        title="Ny besked på dietzcc.dk",
-        body=msg.text[:120],
-        data={"conversation_id": str(conv_id)},
-    )
+    try:
+        preview = msg.text
+        if len(preview) > 120:
+            preview = preview[:117] + "..."
+        send_push_to_admins(
+            title="Ny besked fra hjemmeside",
+            body=preview,
+            data={
+                "conversation_id": str(conv_id),
+                "message_id": str(out.id),
+            },
+        )
+    except Exception:
+        logger.exception("Kunne ikke sende FCM-push for ny besked")
 
     return out
 
@@ -720,28 +753,6 @@ def get_conversation_messages(
             logger.exception("Kunne ikke parse message-doc %s", doc.id)
 
     return results
-
-
-# --- Admin auth placeholder (for f.eks. simpel header) ---
-
-
-def require_admin(x_admin_token: str = Header(..., alias="X-Admin-Token")):
-    """
-    Simpel beskyttelse: kræver at der sendes en header X-Admin-Token
-    som matcher en hemmelig værdi i env ADMIN_API_TOKEN.
-    """
-    expected = os.getenv("ADMIN_API_TOKEN")
-    if not expected:
-        # Hvis der ikke er sat nogen token, tillader vi alt (dev-mode).
-        return None
-
-    if x_admin_token != expected:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-    return None
-
-
-# --- Ekstra endpoint til at markere conversation som læst/ulæst og ændre status ---
 
 
 class UpdateConversationStatus(BaseModel):
