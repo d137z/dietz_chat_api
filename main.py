@@ -449,6 +449,63 @@ def save_message_to_firestore(msg: MessageOut) -> None:
     )
 
 
+def clear_all_chat_data() -> Dict[str, int]:
+    """Slet alle samtaler og beskeder i Firestore og ryd in-memory cache."""
+    global MESSAGES, CONVERSATIONS, NEXT_MESSAGE_ID, NEXT_CONVERSATION_ID, COUNTERS_INITIALIZED
+
+    deleted_conversations = 0
+    deleted_messages = 0
+
+    try:
+        db = get_db()
+    except Exception:
+        logger.exception("Kunne ikke få Firestore-klient til clear_all_chat_data")
+        raise HTTPException(status_code=500, detail="Kunne ikke forbinde til Firestore")
+
+    try:
+        convs_ref = db.collection("conversations")
+        docs = convs_ref.stream()
+        for doc in docs:
+            conv_ref = convs_ref.document(doc.id)
+            try:
+                # Slet alle messages i subcollection'en
+                msg_stream = conv_ref.collection("messages").stream()
+                for msg_doc in msg_stream:
+                    msg_doc.reference.delete()
+                    deleted_messages += 1
+            except Exception:
+                logger.exception("Fejl ved sletning af messages for conversation %s", doc.id)
+
+            # Slet selve conversation-dokumentet
+            try:
+                conv_ref.delete()
+                deleted_conversations += 1
+            except Exception:
+                logger.exception("Fejl ved sletning af conversation %s", doc.id)
+    except Exception:
+        logger.exception("Fejl ved clear_all_chat_data")
+        raise HTTPException(status_code=500, detail="Fejl ved sletning af Firestore-data")
+
+    # Ryd in-memory cache og counters
+    MESSAGES = []
+    CONVERSATIONS = {}
+    NEXT_MESSAGE_ID = 1
+    NEXT_CONVERSATION_ID = 1
+    COUNTERS_INITIALIZED = False
+
+    logger.info(
+        "Clear-all gennemført: %d conversations og %d messages slettet",
+        deleted_conversations,
+        deleted_messages,
+    )
+
+    return {
+        "deleted_conversations": deleted_conversations,
+        "deleted_messages": deleted_messages,
+    }
+
+
+
 def create_conversation(initial_text: str) -> ConversationSummary:
     """Opret en helt ny samtale med første besked-tekst som preview."""
     global NEXT_CONVERSATION_ID
@@ -816,6 +873,17 @@ def update_conversation_status(
     save_conversation_to_firestore(conv)
 
     return conv
+
+
+
+
+@app.post("/admin/clear-all")
+def admin_clear_all(
+    _: None = Depends(require_admin),
+):
+    """Slet alle samtaler og beskeder i Firestore og ryd RAM-cache."""
+    result = clear_all_chat_data()
+    return {"ok": True, **result}
 
 
 # --- Ny route: registrer admin-device til push ---
