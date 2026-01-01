@@ -255,6 +255,23 @@ class MessageIn(BaseModel):
         description="Valgfri e-mail – fx hvis du senere vil kunne følge op på mail",
     )
 
+    # Idempotency: gør det muligt at retry'e sikkert under Render cold-start.
+    # - client_conversation_id bruges når conversation_id endnu ikke er kendt (første besked)
+    # - client_message_id bruges til at undgå dubletter ved retry
+    client_conversation_id: Optional[str] = Field(
+        None,
+        description=(
+            "Stabil klient-id for samtalen (UUID). Bruges når conversation_id er None, "
+            "så gentagne POSTs ikke opretter flere samtaler."
+        ),
+    )
+    client_message_id: Optional[str] = Field(
+        None,
+        description=(
+            "Stabil klient-id for beskeden (UUID). Bruges til at undgå dubletter ved retry."
+        ),
+    )
+
 
 class MessageOut(BaseModel):
     id: int
@@ -264,6 +281,7 @@ class MessageOut(BaseModel):
     sender: str  # "visitor" eller "agent"
     name: Optional[str] = None
     email: Optional[str] = None
+    client_message_id: Optional[str] = None
 
 
 class ConversationSummary(BaseModel):
@@ -287,6 +305,14 @@ CONVERSATIONS: Dict[int, ConversationSummary] = {}
 NEXT_MESSAGE_ID = 1
 NEXT_CONVERSATION_ID = 1
 COUNTERS_INITIALIZED = False
+
+# Idempotency caches (RAM-only fallback hvis Firestore ikke er tilgængelig)
+# - Map fra client_conversation_id -> conversation_id
+CLIENT_CONVERSATION_MAP: Dict[str, int] = {}
+# - Set af (conversation_id, client_message_id) som allerede er oprettet
+SEEN_CLIENT_MESSAGE_IDS: Set[str] = set()
+# - Hurtig lookup til eksisterende MessageOut ved idempotent retry
+MESSAGE_BY_CLIENT_KEY: Dict[str, MessageOut] = {}
 
 
 # --- Simpel admin-auth ---
@@ -404,7 +430,7 @@ def load_conversation_from_firestore(conv_id: int) -> Optional[ConversationSumma
     )
 
 
-def save_conversation_to_firestore(conv: ConversationSummary) -> None:
+def save_conversation_to_firestore(conv: ConversationSummary, client_conversation_id: Optional[str] = None) -> None:
     """Gem samtalens metadata i Firestore (best effort)."""
     try:
         db = get_db()
@@ -413,16 +439,18 @@ def save_conversation_to_firestore(conv: ConversationSummary) -> None:
         return
 
     doc_ref = db.collection("conversations").document(str(conv.id))
-    doc_ref.set(
-        {
-            "id": conv.id,
-            "created_at": conv.created_at,
-            "last_message_at": conv.last_message_at,
-            "last_message_preview": conv.last_message_preview,
-            "is_read": conv.is_read,
-            "status": conv.status,
-        }
-    )
+    payload = {
+        "id": conv.id,
+        "created_at": conv.created_at,
+        "last_message_at": conv.last_message_at,
+        "last_message_preview": conv.last_message_preview,
+        "is_read": conv.is_read,
+        "status": conv.status,
+    }
+    if client_conversation_id:
+        payload["client_conversation_id"] = client_conversation_id
+
+    doc_ref.set(payload)
 
 
 def save_message_to_firestore(msg: MessageOut) -> None:
@@ -445,6 +473,7 @@ def save_message_to_firestore(msg: MessageOut) -> None:
             "sender": msg.sender,
             "name": msg.name,
             "email": msg.email,
+            "client_message_id": msg.client_message_id,
         }
     )
 
@@ -506,7 +535,7 @@ def clear_all_chat_data() -> Dict[str, int]:
 
 
 
-def create_conversation(initial_text: str) -> ConversationSummary:
+def create_conversation(initial_text: str, client_conversation_id: Optional[str] = None) -> ConversationSummary:
     """Opret en helt ny samtale med første besked-tekst som preview."""
     global NEXT_CONVERSATION_ID
 
@@ -525,7 +554,11 @@ def create_conversation(initial_text: str) -> ConversationSummary:
     NEXT_CONVERSATION_ID += 1
 
     # Gem også i Firestore (best effort)
-    save_conversation_to_firestore(conv)
+    save_conversation_to_firestore(conv, client_conversation_id=client_conversation_id)
+
+    # Hold RAM-map i sync, så vi kan dedupe uden Firestore
+    if client_conversation_id:
+        CLIENT_CONVERSATION_MAP[client_conversation_id] = conv.id
 
     return conv
 
@@ -594,8 +627,41 @@ def create_message(msg: MessageIn):
 
     # 1) Find eller opret samtale
     if msg.conversation_id is None:
-        conv = create_conversation(msg.text)
-        conv_id = conv.id
+        # Hvis client_conversation_id er sat, kan vi genbruge samme samtale ved retry
+        if msg.client_conversation_id:
+            # Først: RAM-cache
+            mapped = CLIENT_CONVERSATION_MAP.get(msg.client_conversation_id)
+            if mapped:
+                conv_id = mapped
+                conv = touch_conversation(conv_id, msg.text, from_visitor=True)
+            else:
+                # Prøv Firestore lookup (best effort)
+                conv = None
+                conv_id = None  # type: ignore
+                try:
+                    db = get_db()
+                    docs = (
+                        db.collection("conversations")
+                        .where("client_conversation_id", "==", msg.client_conversation_id)
+                        .limit(1)
+                        .stream()
+                    )
+                    doc = next(docs, None)
+                    if doc is not None and doc.exists:
+                        data = doc.to_dict() or {}
+                        conv_id = int(data.get("id"))
+                        CLIENT_CONVERSATION_MAP[msg.client_conversation_id] = conv_id
+                        conv = touch_conversation(conv_id, msg.text, from_visitor=True)
+                except Exception:
+                    # Hvis Firestore fejler, falder vi tilbage til ny samtale
+                    conv = None
+
+                if conv is None:
+                    conv = create_conversation(msg.text, client_conversation_id=msg.client_conversation_id)
+                    conv_id = conv.id
+        else:
+            conv = create_conversation(msg.text)
+            conv_id = conv.id
     else:
         conv_id = msg.conversation_id
         if conv_id in CONVERSATIONS:
@@ -612,7 +678,46 @@ def create_message(msg: MessageIn):
                 conv = create_conversation(msg.text)
                 conv_id = conv.id
 
-    # 2) Opret selve beskeden
+    # 2) Idempotency: undgå at oprette samme besked flere gange ved retry
+    if msg.client_message_id:
+        client_key = f"{conv_id}:{msg.client_message_id}"
+
+        # RAM-cache først
+        existing = MESSAGE_BY_CLIENT_KEY.get(client_key)
+        if existing is None:
+            # Prøv Firestore lookup (best effort)
+            try:
+                db = get_db()
+                conv_ref = db.collection("conversations").document(str(conv_id))
+                docs = (
+                    conv_ref.collection("messages")
+                    .where("client_message_id", "==", msg.client_message_id)
+                    .limit(1)
+                    .stream()
+                )
+                doc = next(docs, None)
+                if doc is not None and doc.exists:
+                    data = doc.to_dict() or {}
+                    existing = MessageOut(
+                        id=int(data.get("id")),
+                        conversation_id=int(data.get("conversation_id")),
+                        text=data.get("text", ""),
+                        created_at=data.get("created_at", datetime.utcnow()),
+                        sender=data.get("sender", "visitor"),
+                        name=data.get("name"),
+                        email=data.get("email"),
+                        client_message_id=data.get("client_message_id"),
+                    )
+                    MESSAGE_BY_CLIENT_KEY[client_key] = existing
+                    SEEN_CLIENT_MESSAGE_IDS.add(client_key)
+            except Exception:
+                # Ignorér Firestore fejl; vi fortsætter og opretter beskeden (RAM-dedup hjælper delvist)
+                pass
+
+        if existing is not None:
+            return existing
+
+    # 3) Opret selve beskeden
     new_msg = MessageOut(
         id=NEXT_MESSAGE_ID,
         conversation_id=conv_id,
@@ -621,9 +726,15 @@ def create_message(msg: MessageIn):
         sender="visitor",
         name=msg.name,
         email=msg.email,
+        client_message_id=msg.client_message_id,
     )
     MESSAGES.append(new_msg)
     NEXT_MESSAGE_ID += 1
+
+    if msg.client_message_id:
+        client_key = f"{conv_id}:{msg.client_message_id}"
+        MESSAGE_BY_CLIENT_KEY[client_key] = new_msg
+        SEEN_CLIENT_MESSAGE_IDS.add(client_key)
 
     # Gem beskeden i Firestore (best effort)
     save_message_to_firestore(new_msg)
@@ -693,6 +804,7 @@ def list_messages(conversation_id: Optional[int] = None):
                     sender=data.get("sender", "visitor"),
                     name=data.get("name"),
                     email=data.get("email"),
+                    client_message_id=data.get("client_message_id"),
                 )
             )
         except Exception:
@@ -774,6 +886,7 @@ def get_conversation_messages(
                     sender=data.get("sender", "visitor"),
                     name=data.get("name"),
                     email=data.get("email"),
+                    client_message_id=data.get("client_message_id"),
                 )
             )
         except Exception:
@@ -819,6 +932,7 @@ def reply_to_conversation(
         sender="agent",
         name=msg.name,
         email=msg.email,
+        client_message_id=msg.client_message_id,
     )
     MESSAGES.append(new_msg)
     NEXT_MESSAGE_ID += 1
