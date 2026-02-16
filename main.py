@@ -10,6 +10,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from firebase_client import get_db
 from fastapi import UploadFile, File
 from datetime import timezone
+from fastapi import UploadFile, File, Form
+from fastapi.responses import FileResponse
+from pathlib import Path
 
 # Try import Firestore query helpers (til counters og collection_group)
 try:
@@ -1038,9 +1041,12 @@ def register_admin_device(
 
 BILKA_ADMIN_PASSWORD = os.getenv("BILKA_ADMIN_PASSWORD", "")
 BILKA_WORKER_TOKEN = os.getenv("BILKA_WORKER_TOKEN", "")
-FIREBASE_STORAGE_BUCKET = os.getenv("FIREBASE_STORAGE_BUCKET", "")  # fx "<project>.appspot.com"
 
 BILKA_JOBS_COLLECTION = "bilka_jobs"
+
+# Lokalt upload-dir på Render
+UPLOAD_DIR = Path("uploads/mealplans")
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def require_bilka_admin(authorization: Optional[str] = Header(default=None)):
@@ -1170,43 +1176,40 @@ def bilka_worker_update(body: Dict, _: None = Depends(require_bilka_worker)):
 
 @app.post("/bilka/worker/upload_pdf")
 def bilka_worker_upload_pdf(
-    id: str = Depends(lambda: None),  # placeholder; vi læser fra form nedenfor
-):
-    # NOTE: FastAPI håndterer multipart via params i function signature.
-    # Vi laver det "rigtigt" nedenfor i en separat route.
-    raise HTTPException(status_code=501, detail="Use /bilka/worker/upload_pdf2")
-
-
-@app.post("/bilka/worker/upload_pdf2")
-def bilka_worker_upload_pdf2(
+    id: str = Form(...),
     file: UploadFile = File(...),
-    id: str = "",
     _: None = Depends(require_bilka_worker),
 ):
     """
-    Pi uploader output/mealplan.pdf her.
-    Backend uploader til Firebase Storage og returnerer et public link.
+    Pi uploader output/mealplan.pdf her (multipart form):
+      - id=<job_id>
+      - file=@mealplan.pdf
+    Vi gemmer filen lokalt på Render.
     """
-    if not FIREBASE_STORAGE_BUCKET:
-        raise HTTPException(status_code=500, detail="FIREBASE_STORAGE_BUCKET not set")
-
-    if not FCM_AVAILABLE:
-        raise HTTPException(status_code=500, detail="firebase_admin not installed on server")
-
-    # import storage lazily (så deploy ikke fejler hvis storage ikke er i brug)
-    from firebase_admin import storage  # type: ignore
-
-    if not id:
+    if not id.strip():
         raise HTTPException(status_code=400, detail="Missing id")
 
-    # sørg for firebase app er init (du init'er allerede FIREBASE_APP ovenfor)
-    bucket = storage.bucket(name=FIREBASE_STORAGE_BUCKET)
-    blob = bucket.blob(f"mealplans/{id}.pdf")
-
+    out = UPLOAD_DIR / f"{id}.pdf"
     data = file.file.read()
-    blob.upload_from_string(data, content_type="application/pdf")
+    out.write_bytes(data)
 
-    # nem løsning: gør public (alternativ: signed URL)
-    blob.make_public()
-    return {"pdf_url": blob.public_url}
+    # Gem pdf_url i job-dokumentet (praktisk for UI)
+    pdf_url = f"/bilka/jobs/{id}/pdf"
+    try:
+        db = get_db()
+        db.collection(BILKA_JOBS_COLLECTION).document(id).update({"pdf_url": pdf_url})
+    except Exception:
+        logger.exception("Kunne ikke opdatere pdf_url i bilka_jobs/%s", id)
 
+    return {"pdf_url": pdf_url}
+
+
+@app.get("/bilka/jobs/{job_id}/pdf")
+def bilka_job_pdf(job_id: str, _: None = Depends(require_bilka_admin)):
+    """
+    Download PDF (kræver admin bearer).
+    """
+    path = UPLOAD_DIR / f"{job_id}.pdf"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="PDF not found")
+    return FileResponse(str(path), media_type="application/pdf", filename="mealplan.pdf")
