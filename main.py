@@ -8,6 +8,8 @@ from fastapi import FastAPI, Depends, Header, HTTPException
 from pydantic import BaseModel, Field
 from fastapi.middleware.cors import CORSMiddleware
 from firebase_client import get_db
+from fastapi import UploadFile, File
+from datetime import timezone
 
 # Try import Firestore query helpers (til counters og collection_group)
 try:
@@ -1027,3 +1029,184 @@ def register_admin_device(
         "Registrerede admin-device token (nu %d tokens)", len(ADMIN_DEVICE_TOKENS)
     )
     return {"ok": True}
+
+# ----------------------------
+# BilkaToGo job-kø (Firestore)
+# ----------------------------
+
+
+
+BILKA_ADMIN_PASSWORD = os.getenv("BILKA_ADMIN_PASSWORD", "")
+BILKA_WORKER_TOKEN = os.getenv("BILKA_WORKER_TOKEN", "")
+FIREBASE_STORAGE_BUCKET = os.getenv("FIREBASE_STORAGE_BUCKET", "")  # fx "<project>.appspot.com"
+
+BILKA_JOBS_COLLECTION = "bilka_jobs"
+
+
+def require_bilka_admin(authorization: Optional[str] = Header(default=None)):
+    """
+    UI auth:
+      Authorization: Bearer <token>
+    Token er i praksis BILKA_ADMIN_PASSWORD (hold den LANG og hemmelig).
+    """
+    if not BILKA_ADMIN_PASSWORD:
+        # dev-mode: hvis du ikke har sat password, så tillad alt
+        return
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing Bearer token")
+    token = authorization.split(" ", 1)[1].strip()
+    if token != BILKA_ADMIN_PASSWORD:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+def require_bilka_worker(authorization: Optional[str] = Header(default=None)):
+    """
+    Pi worker auth:
+      Authorization: Bearer <worker_token>
+    """
+    if not BILKA_WORKER_TOKEN:
+        raise HTTPException(status_code=500, detail="Worker token not configured")
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing Bearer token")
+    token = authorization.split(" ", 1)[1].strip()
+    if token != BILKA_WORKER_TOKEN:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+class BilkaLoginIn(BaseModel):
+    password: str
+
+
+class BilkaJobCreateIn(BaseModel):
+    meals: int = Field(..., ge=1, le=30)
+    clear_cart: bool = False
+    min_meal_dkk: float = 0
+    max_total_dkk: float = 0
+
+
+@app.post("/bilka/login")
+def bilka_login(payload: BilkaLoginIn):
+    """
+    Simpelt login:
+    - Hvis password matcher BILKA_ADMIN_PASSWORD, returner token = samme streng.
+    UI gemmer token og sender den som Bearer fremover.
+    """
+    if not BILKA_ADMIN_PASSWORD:
+        raise HTTPException(status_code=500, detail="BILKA_ADMIN_PASSWORD not set on server")
+    if payload.password != BILKA_ADMIN_PASSWORD:
+        raise HTTPException(status_code=401, detail="Bad password")
+    return {"token": BILKA_ADMIN_PASSWORD}
+
+
+@app.post("/bilka/jobs")
+def bilka_create_job(payload: BilkaJobCreateIn, _: None = Depends(require_bilka_admin)):
+    db = get_db()
+
+    job = {
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "status": "pending",
+        "meals": int(payload.meals),
+        "clear_cart": bool(payload.clear_cart),
+        "min_meal_dkk": float(payload.min_meal_dkk or 0),
+        "max_total_dkk": float(payload.max_total_dkk or 0),
+        "log": "",
+        "pdf_url": "",
+    }
+
+    ref = db.collection(BILKA_JOBS_COLLECTION).document()
+    ref.set(job)
+    return {"id": ref.id}
+
+
+@app.get("/bilka/jobs")
+def bilka_list_jobs(limit: int = 20, _: None = Depends(require_bilka_admin)):
+    limit = max(1, min(50, int(limit)))
+    db = get_db()
+
+    docs = (
+        db.collection(BILKA_JOBS_COLLECTION)
+        .order_by("created_at", direction="DESCENDING")
+        .limit(limit)
+        .stream()
+    )
+    jobs = [{"id": d.id, **(d.to_dict() or {})} for d in docs]
+    return {"jobs": jobs}
+
+
+@app.post("/bilka/worker/poll")
+def bilka_worker_poll(_: None = Depends(require_bilka_worker)):
+    db = get_db()
+
+    q = (
+        db.collection(BILKA_JOBS_COLLECTION)
+        .where("status", "==", "pending")
+        .order_by("created_at")
+        .limit(1)
+    )
+    docs = list(q.stream())
+    if not docs:
+        return {"job": None}
+
+    d = docs[0]
+    db.collection(BILKA_JOBS_COLLECTION).document(d.id).update({"status": "running"})
+    return {"job": {"id": d.id, **(d.to_dict() or {})}}
+
+
+@app.post("/bilka/worker/update")
+def bilka_worker_update(body: Dict, _: None = Depends(require_bilka_worker)):
+    job_id = body.get("id")
+    if not job_id:
+        raise HTTPException(status_code=400, detail="Missing id")
+
+    patch = {}
+    for k in ("status", "log", "pdf_url"):
+        if k in body:
+            patch[k] = body[k]
+
+    db = get_db()
+    db.collection(BILKA_JOBS_COLLECTION).document(job_id).update(patch)
+    return {"ok": True}
+
+
+@app.post("/bilka/worker/upload_pdf")
+def bilka_worker_upload_pdf(
+    id: str = Depends(lambda: None),  # placeholder; vi læser fra form nedenfor
+):
+    # NOTE: FastAPI håndterer multipart via params i function signature.
+    # Vi laver det "rigtigt" nedenfor i en separat route.
+    raise HTTPException(status_code=501, detail="Use /bilka/worker/upload_pdf2")
+
+
+@app.post("/bilka/worker/upload_pdf2")
+def bilka_worker_upload_pdf2(
+    file: UploadFile = File(...),
+    id: str = "",
+    _: None = Depends(require_bilka_worker),
+):
+    """
+    Pi uploader output/mealplan.pdf her.
+    Backend uploader til Firebase Storage og returnerer et public link.
+    """
+    if not FIREBASE_STORAGE_BUCKET:
+        raise HTTPException(status_code=500, detail="FIREBASE_STORAGE_BUCKET not set")
+
+    if not FCM_AVAILABLE:
+        raise HTTPException(status_code=500, detail="firebase_admin not installed on server")
+
+    # import storage lazily (så deploy ikke fejler hvis storage ikke er i brug)
+    from firebase_admin import storage  # type: ignore
+
+    if not id:
+        raise HTTPException(status_code=400, detail="Missing id")
+
+    # sørg for firebase app er init (du init'er allerede FIREBASE_APP ovenfor)
+    bucket = storage.bucket(name=FIREBASE_STORAGE_BUCKET)
+    blob = bucket.blob(f"mealplans/{id}.pdf")
+
+    data = file.file.read()
+    blob.upload_from_string(data, content_type="application/pdf")
+
+    # nem løsning: gør public (alternativ: signed URL)
+    blob.make_public()
+    return {"pdf_url": blob.public_url}
+
