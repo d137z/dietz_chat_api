@@ -214,6 +214,7 @@ app.add_middleware(
         "https://www.dietzcc.dk",
         "https://dietzcc.dk",
         "http://localhost:5173",  # til lokal test
+        "https://prismatic-marzipan-6f51be.netlify.app"
     ],
     allow_credentials=True,
     allow_methods=["*"],
