@@ -9,6 +9,7 @@ from fastapi import FastAPI, Depends, Header, HTTPException, UploadFile, File, F
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
+from fastapi import Request
 
 from firebase_client import get_db
 
@@ -349,7 +350,17 @@ def bilka_worker_upload_pdf(
     data = file.file.read()
     out.write_bytes(data)
 
-    pdf_url = f"/bilka/jobs/{id}/pdf"
+   
+@app.post("/bilka/worker/upload_pdf")
+def bilka_worker_upload_pdf(
+    request: Request,
+    id: str = Form(...),
+    file: UploadFile = File(...),
+    _: None = Depends(require_bilka_worker),
+):
+    ...
+    pdf_url = str(request.base_url).rstrip("/") + f"/bilka/jobs/{id}/pdf"
+
     try:
         db = get_db()
         db.collection(BILKA_JOBS_COLLECTION).document(id).update({"pdf_url": pdf_url})
